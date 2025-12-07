@@ -1,10 +1,16 @@
-## 3.2.0
+## 3.2.2
 
-## What's Changed
+maintenance release with updated dependencies
+
+## 3.2.1
+
+maintenance release with updated dependencies
+
+## 3.2.0
 
 ### Exciting New Features 🎉
 
-- feat: filter grouping multiple workflows by queue-name by @cdiaz-nex in https://github.com/softprops/turnstyle/pull/120
+- feat: filter grouping of multiple workflows by queue-name by @cdiaz-nex in https://github.com/softprops/turnstyle/pull/120
 
 ### Other Changes 🔄
 
@@ -16,13 +22,12 @@
 
 ## 3.0.0
 
-- Upgrade Node.js version to 24 in action
-  Make sure your runner is on version v2.327.1 or later to ensure compatibility with this release. [Release Notes](https://github.com/actions/runner/releases/tag/v2.327.1)
+- Upgrade Node.js version to 24 in action. Make sure your runner is on version v2.327.1 or later to ensure compatibility with this release. [Release Notes](https://github.com/actions/runner/releases/tag/v2.327.1)
 
 ## 2.4.0
 
 - Migrate from jest to vitest
-- Bump to use node 24
+- Bump to use Node.js 24
 - Dependency updates
 
 ## 2.3.2
@@ -34,8 +39,6 @@ maintenance release with updated dependencies
 maintenance release with updated dependencies
 
 ## 2.3.0
-
-## What's Changed
 
 ### Exciting New Features 🎉
 
@@ -57,7 +60,7 @@ maintenance release with updated dependencies
 
 ### Exciting New Features 🎉
 
-- feature: support GitHub Enterprise by @zachwhaley in https://github.com/softprops/turnstyle/pull/62
+- feat: support GitHub Enterprise by @zachwhaley in https://github.com/softprops/turnstyle/pull/62
 - feat: wait for "waiting" runs as well as "in_progress" and "queued" by @zachwhaley in https://github.com/softprops/turnstyle/pull/63
 - feat: get github.token as default input by @qoomon in https://github.com/softprops/turnstyle/pull/61
 
@@ -70,7 +73,7 @@ maintenance release with updated dependencies
 
 ### Bug fixes 🐛
 
-- fix: ignore inconsistent runs that have a status set to 'in_progress' but conclusion is 'success' by @gustaff-weldon in https://github.com/softprops/turnstyle/pull/50
+- fix: ignore inconsistent runs with status in_progress but conclusion success by @gustaff-weldon in https://github.com/softprops/turnstyle/pull/50
 
 ## 2.0.0
 
@@ -90,7 +93,7 @@ maintenance release with updated dependencies
 ## 0.1.3
 
 - Introduce `same-branch-only` input, used to explicitly control whether a workflow runs should be synchronized across branches. The default remains `true` but can now be overridden to `false` [#7](https://github.com/softprops/turnstyle/pull/7)
-- Favour `GITHUB_HEAD_REF` for branch name when present, typically the case for `pull_request` triggers [#8](https://github.com/softprops/turnstyle/pull/8)
+- Favor `GITHUB_HEAD_REF` for branch name when present, typically the case for `pull_request` triggers [#8](https://github.com/softprops/turnstyle/pull/8)
 
 ## 0.1.2
 
@@ -98,7 +101,7 @@ maintenance release with updated dependencies
 
 ## 0.1.1
 
-- Fix bug where `poll-interval-seconds` and `continue-after-seconds` where not getting parsed correctly as action inputs [#2](https://github.com/softprops/turnstyle/pull/2)
+- Fix bug where `poll-interval-seconds` and `continue-after-seconds` were not getting parsed correctly as action inputs [#2](https://github.com/softprops/turnstyle/pull/2)
 
 ## 0.1.0
 
