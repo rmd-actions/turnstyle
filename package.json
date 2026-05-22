@@ -1,6 +1,6 @@
 {
   "name": "turnstyle",
-  "version": "3.2.3",
+  "version": "3.2.4",
   "private": true,
   "description": "GitHub Action for limiting one workflow to complete at a time",
   "main": "lib/main.js",
@@ -16,7 +16,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/softprops/diffset.git"
+    "url": "git+https://github.com/softprops/turnstyle.git"
   },
   "keywords": [
     "actions",
@@ -25,20 +25,23 @@
   "author": "softprops",
   "license": "MIT",
   "dependencies": {
-    "@actions/core": "^3.0.0",
+    "@actions/core": "^3.0.1",
     "@octokit/plugin-throttling": "^11.0.3",
     "@octokit/rest": "^22.0.1"
   },
   "devDependencies": {
-    "esbuild": "^0.27.3",
-    "@types/node": "^24.11.0",
-    "@vercel/ncc": "^0.38.4",
-    "@vitest/coverage-v8": "^4.0.18",
+    "@types/node": "^24.12.2",
+    "@vitest/coverage-v8": "^4.1.5",
+    "esbuild": "^0.28.0",
     "husky": "^9.1.7",
-    "lint-staged": "^16.3.1",
-    "prettier": "^3.8.1",
-    "typescript": "^5.9.3",
+    "lint-staged": "^16.4.0",
+    "prettier": "^3.8.3",
+    "typescript": "^6.0.3",
     "vitest": "^4.0.6"
+  },
+  "overrides": {
+    "undici": "6.25.0",
+    "yaml": "2.8.4"
   },
   "lint-staged": {
     "{__tests__,src}/**/*.ts": [
