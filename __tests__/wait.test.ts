@@ -1,7 +1,14 @@
+import { setOutput } from '@actions/core';
 import { assert, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { Input } from '../src/input';
 import { Waiter } from '../src/wait';
+
+vi.mock('@actions/core', () => ({
+  setOutput: vi.fn(),
+}));
+
+const setOutputMock = vi.mocked(setOutput);
 
 describe('wait', () => {
   describe('Waiter', () => {
@@ -13,6 +20,7 @@ describe('wait', () => {
       };
 
       beforeEach(() => {
+        setOutputMock.mockClear();
         input = {
           branch: 'master',
           continueAfterSeconds: undefined,
@@ -22,8 +30,10 @@ describe('wait', () => {
           owner: 'org',
           repo: 'repo',
           runId: 2,
+          runAttempt: 1,
           workflowName: workflow.name,
-          sameBranchOnly: true,
+          workflowPath: undefined,
+          sameBranchOnly: false,
           jobToWaitFor: undefined,
           stepToWaitFor: undefined,
           initialWaitSeconds: 0,
@@ -66,6 +76,29 @@ describe('wait', () => {
         ]);
       });
 
+      it('will continue immediately when continue-after-seconds is zero', async () => {
+        input.continueAfterSeconds = 0;
+        const githubClient = {
+          runs: vi.fn(),
+          workflows: async (owner: string, repo: string) => Promise.resolve([workflow]),
+        };
+
+        const messages: Array<string> = [];
+        const waiter = new Waiter(
+          workflow.id,
+          // @ts-ignore
+          githubClient,
+          input,
+          (message: string) => {
+            messages.push(message);
+          },
+          () => {},
+        );
+        assert.equal(await waiter.wait(), 0);
+        expect(githubClient.runs).not.toHaveBeenCalled();
+        assert.deepEqual(messages, ['🤙Exceeded wait seconds. Continuing...']);
+      });
+
       it('will abort after a prescribed number of seconds', async () => {
         input.abortAfterSeconds = 1;
         const inProgressRun = {
@@ -101,6 +134,32 @@ describe('wait', () => {
         assert.deepEqual(messages, ['✋Awaiting run  ...', '🛑Exceeded wait seconds. Aborting...']);
       });
 
+      it('will abort immediately when abort-after-seconds is zero', async () => {
+        input.abortAfterSeconds = 0;
+        const githubClient = {
+          runs: vi.fn(),
+          workflows: async (owner: string, repo: string) => Promise.resolve([workflow]),
+        };
+
+        const messages: Array<string> = [];
+        const waiter = new Waiter(
+          workflow.id,
+          // @ts-ignore
+          githubClient,
+          input,
+          (message: string) => {
+            messages.push(message);
+          },
+          () => {},
+        );
+        await expect(waiter.wait()).rejects.toMatchObject({
+          name: 'Error',
+          message: 'Aborted after waiting 0 seconds',
+        });
+        expect(githubClient.runs).not.toHaveBeenCalled();
+        assert.deepEqual(messages, ['🛑Exceeded wait seconds. Aborting...']);
+      });
+
       it('will return when a run is completed', async () => {
         const run = {
           id: 1,
@@ -130,6 +189,8 @@ describe('wait', () => {
         );
         await waiter.wait();
         assert.deepEqual(messages, ['✋Awaiting run 1 ...']);
+        expect(setOutputMock).toHaveBeenCalledWith('previous_run_id', '1');
+        expect(setOutputMock).toHaveBeenCalledWith('previous_run_url', '1');
       });
 
       it('will wait for all previous runs', async () => {
@@ -192,6 +253,100 @@ describe('wait', () => {
         assert.deepEqual(messages[messages.length - 1], `✋Awaiting run ${input.runId - 1} ...`);
       });
 
+      it('preserves the newest previous run output while a backlog drains', async () => {
+        input.runId = 3;
+        input.pollIntervalSeconds = 0;
+
+        const olderRun = {
+          id: 1,
+          status: 'in_progress',
+          html_url: 'older-run',
+        };
+        const newestPreviousRun = {
+          id: 2,
+          status: 'in_progress',
+          html_url: 'newest-previous-run',
+        };
+
+        const githubClient = {
+          runs: vi
+            .fn()
+            .mockResolvedValueOnce([olderRun, newestPreviousRun])
+            .mockResolvedValueOnce([olderRun])
+            .mockResolvedValue([]),
+          workflows: async (owner: string, repo: string) => Promise.resolve([workflow]),
+        };
+
+        const messages: Array<string> = [];
+        const waiter = new Waiter(
+          workflow.id,
+          // @ts-ignore
+          githubClient,
+          input,
+          (message: string) => {
+            messages.push(message);
+          },
+          () => {},
+        );
+
+        await waiter.wait();
+
+        assert.deepEqual(messages, [
+          '✋Awaiting run newest-previous-run ...',
+          '✋Awaiting run older-run ...',
+        ]);
+        expect(
+          setOutputMock.mock.calls
+            .filter(([name]) => name === 'previous_run_id')
+            .map(([, value]) => value),
+        ).toEqual(['2']);
+        expect(
+          setOutputMock.mock.calls
+            .filter(([name]) => name === 'previous_run_url')
+            .map(([, value]) => value),
+        ).toEqual(['newest-previous-run']);
+      });
+
+      it('will wait for an older predecessor behind newer active runs', async () => {
+        input.runId = 1000;
+        input.pollIntervalSeconds = 0;
+
+        const newerActiveRuns = Array.from({ length: 500 }, (_, index) => ({
+          id: input.runId + index + 1,
+          status: 'in_progress',
+          html_url: 'newer-' + (index + 1),
+        }));
+        const predecessorRun = {
+          id: input.runId - 1,
+          status: 'queued',
+          html_url: 'predecessor-run',
+        };
+
+        const githubClient = {
+          runs: vi
+            .fn()
+            .mockResolvedValueOnce([...newerActiveRuns, predecessorRun])
+            .mockResolvedValue([]),
+          workflows: async (owner: string, repo: string) => Promise.resolve([workflow]),
+        };
+
+        const messages: Array<string> = [];
+        const waiter = new Waiter(
+          workflow.id,
+          // @ts-ignore
+          githubClient,
+          input,
+          (message: string) => {
+            messages.push(message);
+          },
+          () => {},
+        );
+
+        await waiter.wait();
+
+        expect(messages[0]).toBe('✋Awaiting run predecessor-run ...');
+      });
+
       it('will wait for in_progress, queued, and waiting runs', async () => {
         const existingRuns = [
           {
@@ -252,6 +407,380 @@ describe('wait', () => {
         assert.deepEqual(messages[messages.length - 1], `✋Awaiting run ${input.runId - 1} ...`);
       });
 
+      it('will wait for an active run that started before a rerun attempt', async () => {
+        input.runId = 1;
+        input.runAttempt = 2;
+
+        const currentRun = {
+          id: 1,
+          run_attempt: 2,
+          status: 'in_progress',
+          html_url: 'current-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:02:00Z',
+          created_at: '2026-05-03T10:02:00Z',
+        };
+        const earlierActiveRun = {
+          id: 2,
+          status: 'in_progress',
+          html_url: 'earlier-active-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:01:00Z',
+          created_at: '2026-05-03T10:01:00Z',
+        };
+        const laterActiveRun = {
+          id: 3,
+          status: 'in_progress',
+          html_url: 'later-active-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:03:00Z',
+          created_at: '2026-05-03T10:03:00Z',
+        };
+
+        const githubClient = {
+          runs: vi
+            .fn()
+            .mockResolvedValueOnce([currentRun, earlierActiveRun, laterActiveRun])
+            .mockResolvedValue([currentRun]),
+          workflows: async (owner: string, repo: string) => Promise.resolve([workflow]),
+        };
+
+        const messages: Array<string> = [];
+        const waiter = new Waiter(
+          workflow.id,
+          // @ts-ignore
+          githubClient,
+          input,
+          (message: string) => {
+            messages.push(message);
+          },
+          () => {},
+        );
+
+        await waiter.wait();
+
+        expect(messages[0]).toBe('✋Awaiting run earlier-active-run ...');
+      });
+
+      it('will wait for an active run created before a rerun attempt that starts afterward', async () => {
+        input.runId = 1;
+        input.runAttempt = 2;
+        input.pollIntervalSeconds = 0;
+
+        const currentRun = {
+          id: 1,
+          run_attempt: 2,
+          status: 'in_progress',
+          html_url: 'current-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:02:00Z',
+          created_at: '2026-05-03T10:02:00Z',
+        };
+        const queuedBeforeRerun = {
+          id: 2,
+          run_attempt: 1,
+          status: 'in_progress',
+          html_url: 'queued-before-rerun',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:03:00Z',
+          created_at: '2026-05-03T10:01:00Z',
+        };
+        const laterActiveRun = {
+          id: 3,
+          status: 'in_progress',
+          html_url: 'later-active-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:03:00Z',
+          created_at: '2026-05-03T10:03:00Z',
+        };
+
+        const githubClient = {
+          runs: vi
+            .fn()
+            .mockResolvedValueOnce([currentRun, queuedBeforeRerun, laterActiveRun])
+            .mockResolvedValue([currentRun]),
+          workflows: async (owner: string, repo: string) => Promise.resolve([workflow]),
+        };
+
+        const messages: Array<string> = [];
+        const waiter = new Waiter(
+          workflow.id,
+          // @ts-ignore
+          githubClient,
+          input,
+          (message: string) => {
+            messages.push(message);
+          },
+          () => {},
+        );
+
+        await waiter.wait();
+
+        expect(messages[0]).toBe('✋Awaiting run queued-before-rerun ...');
+      });
+
+      it('will not use original creation time to order later rerun attempts', async () => {
+        input.runId = 1;
+        input.runAttempt = 2;
+        input.pollIntervalSeconds = 0;
+
+        const currentRun = {
+          id: 1,
+          run_attempt: 2,
+          status: 'in_progress',
+          html_url: 'current-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:02:00Z',
+          created_at: '2026-05-03T10:02:00Z',
+        };
+        const laterRerun = {
+          id: 2,
+          run_attempt: 2,
+          status: 'in_progress',
+          html_url: 'later-rerun',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:03:00Z',
+          created_at: '2026-05-03T10:01:00Z',
+        };
+
+        const githubClient = {
+          runs: vi.fn().mockResolvedValue([currentRun, laterRerun]),
+          workflows: async (owner: string, repo: string) => Promise.resolve([workflow]),
+        };
+
+        const messages: Array<string> = [];
+        const waiter = new Waiter(
+          workflow.id,
+          // @ts-ignore
+          githubClient,
+          input,
+          (message: string) => {
+            messages.push(message);
+          },
+          () => {},
+        );
+
+        await waiter.wait();
+
+        expect(messages).toEqual([]);
+        expect(setOutputMock).toHaveBeenCalledWith('previous_run_id', '');
+        expect(setOutputMock).toHaveBeenCalledWith('previous_run_url', '');
+      });
+
+      it('will not wait for a lower-id rerun attempt that starts after the current run', async () => {
+        input.runId = 3;
+        input.runAttempt = 1;
+        input.pollIntervalSeconds = 0;
+
+        const currentRun = {
+          id: 3,
+          run_attempt: 1,
+          status: 'in_progress',
+          html_url: 'current-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:02:00Z',
+          created_at: '2026-05-03T10:02:00Z',
+        };
+        const laterRerun = {
+          id: 1,
+          run_attempt: 2,
+          status: 'in_progress',
+          html_url: 'later-rerun',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:03:00Z',
+          created_at: '2026-05-03T10:00:00Z',
+        };
+
+        const githubClient = {
+          runs: vi.fn().mockResolvedValue([currentRun, laterRerun]),
+          workflows: async (owner: string, repo: string) => Promise.resolve([workflow]),
+        };
+
+        const messages: Array<string> = [];
+        const waiter = new Waiter(
+          workflow.id,
+          // @ts-ignore
+          githubClient,
+          input,
+          (message: string) => {
+            messages.push(message);
+          },
+          () => {},
+        );
+
+        await waiter.wait();
+
+        expect(messages).toEqual([]);
+      });
+
+      it('will not wait for a run that starts after the current run', async () => {
+        input.runId = 2;
+
+        const currentRun = {
+          id: 2,
+          run_attempt: 1,
+          status: 'in_progress',
+          html_url: 'current-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:00:00Z',
+          created_at: '2026-05-03T10:00:00Z',
+        };
+        const laterActiveRun = {
+          id: 3,
+          status: 'in_progress',
+          html_url: 'later-active-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:01:00Z',
+          created_at: '2026-05-03T10:01:00Z',
+        };
+
+        const githubClient = {
+          runs: vi.fn().mockResolvedValue([currentRun, laterActiveRun]),
+          workflows: async (owner: string, repo: string) => Promise.resolve([workflow]),
+        };
+
+        const messages: Array<string> = [];
+        const waiter = new Waiter(
+          workflow.id,
+          // @ts-ignore
+          githubClient,
+          input,
+          (message: string) => {
+            messages.push(message);
+          },
+          () => {},
+        );
+
+        await waiter.wait();
+
+        expect(messages).toEqual([]);
+      });
+
+      it('will wait for a lower-id first-attempt run that starts after the current run', async () => {
+        input.runId = 2;
+        input.runAttempt = 1;
+
+        const currentRun = {
+          id: 2,
+          run_attempt: 1,
+          status: 'in_progress',
+          html_url: 'current-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:00:00Z',
+          created_at: '2026-05-03T10:00:00Z',
+        };
+        const lowerIdActiveRun = {
+          id: 1,
+          status: 'in_progress',
+          html_url: 'lower-id-active-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:01:00Z',
+          created_at: '2026-05-03T10:01:00Z',
+        };
+
+        const githubClient = {
+          runs: vi
+            .fn()
+            .mockResolvedValueOnce([currentRun, lowerIdActiveRun])
+            .mockResolvedValue([currentRun]),
+          workflows: async (owner: string, repo: string) => Promise.resolve([workflow]),
+        };
+
+        const messages: Array<string> = [];
+        const waiter = new Waiter(
+          workflow.id,
+          // @ts-ignore
+          githubClient,
+          input,
+          (message: string) => {
+            messages.push(message);
+          },
+          () => {},
+        );
+
+        await waiter.wait();
+
+        expect(messages[0]).toBe('✋Awaiting run lower-id-active-run ...');
+      });
+
+      it('filters active runs and branches client-side', async () => {
+        input.runId = 5;
+        input.sameBranchOnly = true;
+
+        const currentRun = {
+          id: 5,
+          run_attempt: 1,
+          status: 'in_progress',
+          html_url: 'current-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:05:00Z',
+          created_at: '2026-05-03T10:05:00Z',
+        };
+        const sameBranchActiveRun = {
+          id: 1,
+          status: 'queued',
+          html_url: 'same-branch-active-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:01:00Z',
+          created_at: '2026-05-03T10:01:00Z',
+        };
+        const sameBranchCompletedRun = {
+          id: 2,
+          status: 'completed',
+          conclusion: null,
+          html_url: 'same-branch-completed-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:02:00Z',
+          created_at: '2026-05-03T10:02:00Z',
+        };
+        const otherBranchActiveRun = {
+          id: 3,
+          status: 'waiting',
+          html_url: 'other-branch-active-run',
+          head_branch: 'feature',
+          run_started_at: '2026-05-03T10:03:00Z',
+          created_at: '2026-05-03T10:03:00Z',
+        };
+        const unknownBranchActiveRun = {
+          id: 4,
+          status: 'in_progress',
+          html_url: 'unknown-branch-active-run',
+          head_branch: null,
+          run_started_at: '2026-05-03T10:04:00Z',
+          created_at: '2026-05-03T10:04:00Z',
+        };
+
+        const githubClient = {
+          runs: vi
+            .fn()
+            .mockResolvedValueOnce([
+              currentRun,
+              sameBranchActiveRun,
+              sameBranchCompletedRun,
+              otherBranchActiveRun,
+              unknownBranchActiveRun,
+            ])
+            .mockResolvedValue([currentRun]),
+          workflows: async (owner: string, repo: string) => Promise.resolve([workflow]),
+        };
+
+        const messages: Array<string> = [];
+        const waiter = new Waiter(
+          workflow.id,
+          // @ts-ignore
+          githubClient,
+          input,
+          (message: string) => {
+            messages.push(message);
+          },
+          () => {},
+        );
+
+        await waiter.wait();
+
+        expect(messages[0]).toBe('✋Awaiting run same-branch-active-run ...');
+      });
+
       it('will retry to get previous runs, if not found during first try', async () => {
         // see discussions in https://github.com/vitest-dev/vitest/discussions/7890
         vi.setConfig({ testTimeout: 10_1000 });
@@ -264,6 +793,11 @@ describe('wait', () => {
           status: 'in_progress',
           html_url: '1',
         };
+        const completedRun = {
+          ...run,
+          status: 'completed',
+          conclusion: 'success',
+        };
 
         const mockedRunsFunc = vi
           .fn()
@@ -272,7 +806,7 @@ describe('wait', () => {
           // return the inprogress run
           .mockReturnValueOnce(Promise.resolve([run]))
           // then return the same run as completed
-          .mockReturnValue(Promise.resolve([(run.status = 'completed')]));
+          .mockReturnValue(Promise.resolve([completedRun]));
 
         const githubClient = {
           runs: mockedRunsFunc,
@@ -343,6 +877,80 @@ describe('wait', () => {
           '✋Awaiting job run completion from job job-url ...',
           'Job test-job completed from run 1',
         ]);
+        expect(setOutputMock).toHaveBeenCalledWith('previous_run_id', '1');
+        expect(setOutputMock).toHaveBeenCalledWith('previous_run_url', '1');
+      });
+
+      it('will keep checking previous runs after a rerun predecessor job is complete', async () => {
+        input.runId = 3;
+        input.runAttempt = 2;
+        input.jobToWaitFor = 'test-job';
+        input.pollIntervalSeconds = 0;
+
+        const currentRun = {
+          id: 3,
+          run_attempt: 2,
+          status: 'in_progress',
+          html_url: 'current-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:05:00Z',
+          created_at: '2026-05-03T10:05:00Z',
+        };
+        const olderRerun = {
+          id: 1,
+          status: 'in_progress',
+          html_url: 'older-rerun',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:04:00Z',
+          created_at: '2026-05-03T10:04:00Z',
+        };
+        const newerPreviousRun = {
+          id: 2,
+          status: 'in_progress',
+          html_url: 'newer-previous-run',
+          head_branch: 'master',
+          run_started_at: '2026-05-03T10:03:00Z',
+          created_at: '2026-05-03T10:03:00Z',
+        };
+        const completedJob = {
+          id: 1,
+          name: 'test-job',
+          status: 'completed',
+          html_url: 'completed-job-url',
+        };
+        const activeJob = {
+          id: 2,
+          name: 'test-job',
+          status: 'in_progress',
+          html_url: 'active-job-url',
+        };
+
+        const githubClient = {
+          runs: vi
+            .fn()
+            .mockResolvedValueOnce([currentRun, olderRerun, newerPreviousRun])
+            .mockResolvedValue([currentRun]),
+          jobs: vi.fn().mockResolvedValueOnce([completedJob]).mockResolvedValueOnce([activeJob]),
+          workflows: async (owner: string, repo: string) => Promise.resolve([workflow]),
+        };
+
+        const messages: Array<string> = [];
+        const waiter = new Waiter(
+          workflow.id,
+          // @ts-ignore
+          githubClient,
+          input,
+          (message: string) => {
+            messages.push(message);
+          },
+          () => {},
+        );
+        await waiter.wait();
+
+        assert.deepEqual(messages, [
+          'Job test-job completed from run older-rerun',
+          '✋Awaiting job run completion from job active-job-url ...',
+        ]);
       });
 
       it('will wait for a specific step to complete if wait-for-step is defined', async () => {
@@ -399,6 +1007,8 @@ describe('wait', () => {
           '✋Awaiting step completion from job job-url ...',
           'Step test-step completed from run 1',
         ]);
+        expect(setOutputMock).toHaveBeenCalledWith('previous_run_id', '1');
+        expect(setOutputMock).toHaveBeenCalledWith('previous_run_url', '1');
       });
 
       it('will await the full run if the job is not found', async () => {
@@ -473,8 +1083,10 @@ describe('wait', () => {
             owner: 'org',
             repo: 'repo',
             runId: 4,
+            runAttempt: 1,
             workflowName: workflow1.name,
-            sameBranchOnly: true,
+            workflowPath: undefined,
+            sameBranchOnly: false,
             jobToWaitFor: undefined,
             stepToWaitFor: undefined,
             initialWaitSeconds: 0,
@@ -511,9 +1123,8 @@ describe('wait', () => {
           const mockedRunsFunc = vi
             .fn()
             .mockResolvedValueOnce(workflow1Runs)
+            .mockResolvedValueOnce(workflow1Runs)
             .mockResolvedValueOnce(workflow2Runs)
-            .mockResolvedValue(workflow1Runs.map((r) => ({ ...r, conclusion: 'success' })))
-            .mockResolvedValue(workflow2Runs.map((r) => ({ ...r, conclusion: 'success' })))
             .mockResolvedValue([]);
 
           const githubClient = {
@@ -589,8 +1200,10 @@ describe('wait', () => {
           const githubClient = {
             runs: vi
               .fn()
+              .mockResolvedValueOnce([])
               .mockResolvedValueOnce(allRuns)
-              .mockResolvedValue(allRuns.map((r) => ({ ...r, conclusion: 'success' }))),
+              .mockResolvedValueOnce([])
+              .mockResolvedValue([]),
             workflows: async () => Promise.resolve([workflow1, workflow2]),
           };
 
@@ -639,8 +1252,9 @@ describe('wait', () => {
           const githubClient = {
             runs: vi
               .fn()
+              .mockResolvedValueOnce([])
               .mockResolvedValueOnce(allRuns)
-              .mockResolvedValue(allRuns.map((r) => ({ ...r, conclusion: 'success' }))),
+              .mockResolvedValue([]),
             workflows: async () => Promise.resolve([workflow1]),
           };
 
@@ -715,7 +1329,9 @@ describe('wait', () => {
           expect(hasSearchMessage).toBe(false);
           const hasQueueMessage = debugMessages.some((msg) => msg.includes('matches queue'));
           expect(hasQueueMessage).toBe(false);
-          expect(mockedRunsFunc).toHaveBeenCalledWith('org', 'repo', 'master', workflow1.id);
+          expect(mockedRunsFunc).toHaveBeenCalledWith('org', 'repo', workflow1.id, {
+            branch: undefined,
+          });
         });
 
         it('should batch workflow requests to avoid rate limits', async () => {
@@ -737,9 +1353,10 @@ describe('wait', () => {
 
           const mockedRunsFunc = vi
             .fn()
-            .mockResolvedValueOnce(runs)
-            .mockResolvedValue(runs.map((r) => ({ ...r, conclusion: 'success' })))
-            .mockResolvedValue([]);
+            .mockResolvedValueOnce([])
+            .mockResolvedValue(
+              runs.map((r) => ({ ...r, status: 'completed', conclusion: 'success' })),
+            );
 
           const githubClient = {
             runs: mockedRunsFunc,
@@ -789,9 +1406,8 @@ describe('wait', () => {
 
           const mockedRunsFunc = vi
             .fn()
-            .mockResolvedValueOnce(successfulRuns)
-            .mockResolvedValue(successfulRuns.map((r) => ({ ...r, conclusion: 'success' })))
             .mockResolvedValueOnce([])
+            .mockResolvedValueOnce(successfulRuns)
             .mockRejectedValueOnce(new Error('API Error'))
             .mockResolvedValue([]);
 
@@ -848,6 +1464,7 @@ describe('wait', () => {
 
           const mockedRunsFunc = vi
             .fn()
+            .mockResolvedValueOnce([])
             .mockResolvedValueOnce(workflow1Runs)
             .mockResolvedValueOnce(workflow2Runs)
             .mockResolvedValue([]);
