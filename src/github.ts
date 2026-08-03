@@ -1,12 +1,30 @@
-import { debug, warning } from '@actions/core';
+import { warning } from '@actions/core';
+import { retry } from '@octokit/plugin-retry';
 import { throttling } from '@octokit/plugin-throttling';
 import { Octokit } from '@octokit/rest';
-import { Endpoints } from '@octokit/types';
+import { Endpoints, RequestParameters } from '@octokit/types';
 
-const ThrottledOctokit = Octokit.plugin(throttling);
+const ThrottledOctokit = Octokit.plugin(throttling, retry);
 const MAX_WORKFLOW_RUN_PAGES = 50;
 const ACTIVE_RUN_STATUSES = ['in_progress', 'queued', 'waiting'] as const;
 const ACTIVE_RUN_STATUS_SET = new Set<string>(ACTIVE_RUN_STATUSES);
+const DO_NOT_RETRY_STATUS_CODES = Array.from({ length: 100 }, (_, index) => 400 + index);
+
+export const createThrottleOptions = () => ({
+  onRateLimit: (retryAfter: number, options: any, octokit: any, retryCount: number) => {
+    warning(`Request quota exhausted for request ${options.method} ${options.url}`);
+
+    if (retryCount < 1) {
+      // only retries once
+      warning(`Retrying after ${retryAfter} seconds!`);
+      return true;
+    }
+  },
+  onSecondaryRateLimit: (retryAfter: number, options: any) => {
+    // does not retry, only logs a warning
+    warning(`Secondary rate limit detected for request ${options.method} ${options.url}`);
+  },
+});
 
 export type WorkflowRun =
   Endpoints['GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs']['response']['data']['workflow_runs'][number];
@@ -14,6 +32,10 @@ export type WorkflowRun =
 export interface WorkflowRunFilters {
   branch?: string;
   queueName?: string;
+}
+
+export interface GitHubRequestOptions {
+  signal?: AbortSignal;
 }
 
 const matchesWorkflowRunFilters = (run: WorkflowRun, filters: WorkflowRunFilters) => {
@@ -39,25 +61,20 @@ const matchesWorkflowRunFilters = (run: WorkflowRun, filters: WorkflowRunFilters
 export class OctokitGitHub {
   private readonly octokit: InstanceType<typeof ThrottledOctokit>;
 
-  constructor(githubToken: string) {
+  constructor(githubToken: string, retries: number = 0) {
     this.octokit = new ThrottledOctokit({
       baseUrl: process.env['GITHUB_API_URL'] || 'https://api.github.com',
       auth: githubToken,
-      throttle: {
-        onRateLimit: (retryAfter, options, octokit, retryCount) => {
-          warning(`Request quota exhausted for request ${options.method} ${options.url}`);
-
-          if (retryCount < 1) {
-            // only retries once
-            debug(`Retrying after ${retryAfter} seconds!`);
-            return true;
-          }
-        },
-        onSecondaryRateLimit: (retryAfter, options) => {
-          // does not retry, only logs a warning
-          debug(`Secondary rate limit detected for request ${options.method} ${options.url}`);
-        },
+      // retries defaults to 0, which disables the retry plugin entirely (no
+      // request wrapping). When set, it retries transient 5xx errors with
+      // backoff. All 4xx responses are excluded so permanent client errors and
+      // rate limits do not retry through plugin-retry.
+      retry: {
+        enabled: retries > 0,
+        retries,
+        doNotRetry: DO_NOT_RETRY_STATUS_CODES,
       },
+      throttle: createThrottleOptions(),
     });
   }
 
@@ -68,13 +85,59 @@ export class OctokitGitHub {
       per_page: 100,
     });
 
-  run = async (owner: string, repo: string, run_id: number): Promise<WorkflowRun> => {
+  run = async (
+    owner: string,
+    repo: string,
+    run_id: number,
+    requestOptions: GitHubRequestOptions = {},
+  ): Promise<WorkflowRun> => {
     const { data } = await this.octokit.actions.getWorkflowRun({
       owner,
       repo,
       run_id,
+      ...(requestOptions.signal ? { request: { signal: requestOptions.signal } } : {}),
     });
     return data as WorkflowRun;
+  };
+
+  private listActiveRuns = async (
+    listRuns:
+      | typeof this.octokit.actions.listWorkflowRuns
+      | typeof this.octokit.actions.listWorkflowRunsForRepo,
+    baseOptions: Record<string, unknown>,
+    filters: WorkflowRunFilters,
+    requestOptions: GitHubRequestOptions = {},
+  ): Promise<WorkflowRun[]> => {
+    const runsById = new Map<number, WorkflowRun>();
+    await Promise.all(
+      ACTIVE_RUN_STATUSES.map(async (status) => {
+        let pagesScanned = 0;
+        const runs = (await (this.octokit.paginate as any)(
+          listRuns,
+          {
+            ...baseOptions,
+            ...(filters.branch ? { branch: filters.branch } : {}),
+            status,
+            ...(requestOptions.signal ? { request: { signal: requestOptions.signal } } : {}),
+          },
+          (response: { data: WorkflowRun[] }, done: () => void) => {
+            pagesScanned += 1;
+            const filteredRuns = response.data.filter((run) =>
+              matchesWorkflowRunFilters(run, filters),
+            );
+            if (pagesScanned >= MAX_WORKFLOW_RUN_PAGES) {
+              done();
+            }
+            return filteredRuns;
+          },
+        )) as WorkflowRun[];
+
+        for (const run of runs) {
+          runsById.set(run.id, run);
+        }
+      }),
+    );
+    return [...runsById.values()];
   };
 
   runs = async (
@@ -82,8 +145,9 @@ export class OctokitGitHub {
     repo: string,
     workflow_id: number,
     filters: WorkflowRunFilters = {},
+    requestOptions: GitHubRequestOptions = {},
   ): Promise<WorkflowRun[]> => {
-    type ListWorkflowRunsOptions =
+    type ListWorkflowRunsOptions = RequestParameters &
       Endpoints['GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs']['parameters'];
     const baseOptions: ListWorkflowRunsOptions = {
       owner,
@@ -92,43 +156,34 @@ export class OctokitGitHub {
       per_page: 100,
     };
 
-    const listRuns = async (options: ListWorkflowRunsOptions) => {
-      let pagesScanned = 0;
-      const runs = await this.octokit.paginate(
-        this.octokit.actions.listWorkflowRuns,
-        options,
-        (response, done) => {
-          pagesScanned += 1;
-          const filteredRuns = response.data.filter((run) =>
-            matchesWorkflowRunFilters(run, filters),
-          );
-          if (pagesScanned >= MAX_WORKFLOW_RUN_PAGES) {
-            done();
-          }
-          return filteredRuns;
-        },
-      );
-      return runs;
+    return this.listActiveRuns(
+      this.octokit.actions.listWorkflowRuns,
+      baseOptions,
+      filters,
+      requestOptions,
+    );
+  };
+
+  activeRunsForRepo = async (
+    owner: string,
+    repo: string,
+    filters: WorkflowRunFilters = {},
+    requestOptions: GitHubRequestOptions = {},
+  ): Promise<WorkflowRun[]> => {
+    type ListWorkflowRunsForRepoOptions = RequestParameters &
+      Endpoints['GET /repos/{owner}/{repo}/actions/runs']['parameters'];
+    const baseOptions: ListWorkflowRunsForRepoOptions = {
+      owner,
+      repo,
+      per_page: 100,
     };
 
-    // Combine unfiltered discovery for stale status-filter safety with active status queries so
-    // completed history cannot consume GitHub's search caps.
-    const unfilteredRuns = await listRuns(baseOptions);
-    const statusFilteredRuns = await Promise.all(
-      ACTIVE_RUN_STATUSES.map((status) =>
-        listRuns({
-          ...baseOptions,
-          ...(filters.branch ? { branch: filters.branch } : {}),
-          status,
-        }),
-      ),
+    return this.listActiveRuns(
+      this.octokit.actions.listWorkflowRunsForRepo,
+      baseOptions,
+      filters,
+      requestOptions,
     );
-
-    const runsById = new Map<number, WorkflowRun>();
-    for (const run of [unfilteredRuns, ...statusFilteredRuns].flat()) {
-      runsById.set(run.id, run);
-    }
-    return [...runsById.values()];
   };
 
   jobs = async (owner: string, repo: string, run_id: number) => {
