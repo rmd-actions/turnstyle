@@ -1,7 +1,13 @@
 import { warning } from '@actions/core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { createThrottleOptions, OctokitGitHub, WorkflowRun } from '../src/github';
+import { ActionDeadline, DeadlineReached, type DeadlineTiming } from '../src/deadline';
+import {
+  createThrottleOptions,
+  OctokitGitHub,
+  type GitHubRequestOptions,
+  type WorkflowRun,
+} from '../src/github';
 
 vi.mock('@actions/core', () => ({
   debug: vi.fn(),
@@ -23,81 +29,168 @@ const run = (overrides: Partial<WorkflowRun>): WorkflowRun =>
   }) as WorkflowRun;
 
 type WorkflowRunPages = WorkflowRun[][];
+type PageMapper = (response: { data: WorkflowRun[] }, done: () => void) => WorkflowRun[];
+interface TestOctokit {
+  actions: Record<string, ReturnType<typeof vi.fn>>;
+  paginate: ReturnType<typeof vi.fn>;
+}
+
+const replaceOctokit = (client: OctokitGitHub, octokit: TestOctokit) => {
+  (client as unknown as { octokit: TestOctokit }).octokit = octokit;
+};
+
+const mockRequestMethod = () => {
+  const bound = vi.fn();
+  const defaults = vi.fn().mockReturnValue(bound);
+  const request = Object.assign(vi.fn(), { defaults });
+  return { request, bound, defaults };
+};
+
 const CLIENT_ERROR_STATUSES = Array.from({ length: 100 }, (_, index) => 400 + index);
 const ACTIVE_RUN_STATUSES = ['in_progress', 'queued', 'waiting'];
 
-const clientWithRunPages = (...pagesByCall: WorkflowRunPages[]) => {
-  const client = new OctokitGitHub('fake-token');
-  let paginateCalls = 0;
-  let pagesScanned = 0;
-  const paginate = vi.fn(async (_endpoint, _options, mapFunction) => {
-    const pages = pagesByCall[paginateCalls] || [];
-    paginateCalls += 1;
-    const results: WorkflowRun[] = [];
-    let doneCalled = false;
-    const done = () => {
-      doneCalled = true;
-    };
+const advanceUntilCalled = async (mock: ReturnType<typeof vi.fn>) => {
+  for (let attempt = 0; attempt < 10 && mock.mock.calls.length === 0; attempt += 1) {
+    await vi.advanceTimersToNextTimerAsync();
+  }
+};
 
-    for (const page of pages) {
-      pagesScanned += 1;
-      results.push(...mapFunction({ data: page }, done));
-      if (doneCalled) {
-        break;
-      }
-    }
+const advanceUntilCallCount = async (mock: ReturnType<typeof vi.fn>, count: number) => {
+  for (let attempt = 0; attempt < 20 && mock.mock.calls.length < count; attempt += 1) {
+    await vi.advanceTimersToNextTimerAsync();
+  }
+};
 
-    return results;
-  });
+const flushUntilTimerScheduled = async () => {
+  for (let attempt = 0; attempt < 50 && vi.getTimerCount() === 0; attempt += 1) {
+    await Promise.resolve();
+  }
+};
 
-  (client as any).octokit = {
-    actions: {
-      listWorkflowRuns: vi.fn(),
-      listWorkflowRunsForRepo: vi.fn(),
+const flushMicrotasks = async () => {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    await Promise.resolve();
+  }
+};
+
+const flushShortDelayWorkUntilCalled = async (mock: ReturnType<typeof vi.fn>) => {
+  for (let attempt = 0; attempt < 20 && mock.mock.calls.length === 0; attempt += 1) {
+    await vi.advanceTimersByTimeAsync(1);
+    await flushMicrotasks();
+  }
+};
+
+const manualTiming = () => {
+  let now = 0;
+  let nextTimer = 1;
+  const timers = new Map<number, () => void>();
+  const timing: DeadlineTiming = {
+    now: () => now,
+    setTimeout: (callback) => {
+      const timer = nextTimer++;
+      timers.set(timer, callback);
+      return timer as unknown as ReturnType<typeof setTimeout>;
     },
-    paginate,
+    clearTimeout: (timer) => {
+      timers.delete(timer as unknown as number);
+    },
   };
 
-  return { client, paginate, pagesScanned: () => pagesScanned };
+  return {
+    timing,
+    advanceTo: (milliseconds: number) => {
+      now = milliseconds;
+    },
+    timerCount: () => timers.size,
+  };
+};
+
+const clientWithRunPages = (...pagesByCall: WorkflowRunPages[]) => {
+  const client = new OctokitGitHub('fake-token');
+  const listWorkflowRuns = mockRequestMethod();
+  const listWorkflowRunsForRepo = mockRequestMethod();
+  let paginateCalls = 0;
+  let pagesScanned = 0;
+  const paginate = vi.fn(
+    async (_endpoint: unknown, _options: Record<string, unknown>, mapFunction: PageMapper) => {
+      const pages = pagesByCall[paginateCalls] || [];
+      paginateCalls += 1;
+      const results: WorkflowRun[] = [];
+      let doneCalled = false;
+      const done = () => {
+        doneCalled = true;
+      };
+
+      for (const page of pages) {
+        pagesScanned += 1;
+        results.push(...mapFunction({ data: page }, done));
+        if (doneCalled) {
+          break;
+        }
+      }
+
+      return results;
+    },
+  );
+
+  replaceOctokit(client, {
+    actions: {
+      listWorkflowRuns: listWorkflowRuns.request,
+      listWorkflowRunsForRepo: listWorkflowRunsForRepo.request,
+    },
+    paginate,
+  });
+
+  return {
+    client,
+    listWorkflowRuns,
+    listWorkflowRunsForRepo,
+    paginate,
+    pagesScanned: () => pagesScanned,
+  };
 };
 
 const clientWithDynamicRunPages = (
-  pagesForOptions: (options: Record<string, any>) => WorkflowRunPages,
+  pagesForOptions: (options: Record<string, unknown>) => WorkflowRunPages,
 ) => {
   const client = new OctokitGitHub('fake-token');
   let pagesScanned = 0;
-  const paginate = vi.fn(async (_endpoint, options, mapFunction) => {
-    const pages = pagesForOptions(options);
-    const results: WorkflowRun[] = [];
-    let doneCalled = false;
-    const done = () => {
-      doneCalled = true;
-    };
+  const paginate = vi.fn(
+    async (_endpoint: unknown, options: Record<string, unknown>, mapFunction: PageMapper) => {
+      const pages = pagesForOptions(options);
+      const results: WorkflowRun[] = [];
+      let doneCalled = false;
+      const done = () => {
+        doneCalled = true;
+      };
 
-    for (const page of pages) {
-      pagesScanned += 1;
-      results.push(...mapFunction({ data: page }, done));
-      if (doneCalled) {
-        break;
+      for (const page of pages) {
+        pagesScanned += 1;
+        results.push(...mapFunction({ data: page }, done));
+        if (doneCalled) {
+          break;
+        }
       }
-    }
 
-    return results;
-  });
+      return results;
+    },
+  );
 
-  (client as any).octokit = {
+  replaceOctokit(client, {
     actions: {
       listWorkflowRuns: vi.fn(),
       listWorkflowRunsForRepo: vi.fn(),
     },
     paginate,
-  };
+  });
 
   return { client, paginate, pagesScanned: () => pagesScanned };
 };
 
 describe('github', () => {
   afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
     vi.clearAllMocks();
   });
@@ -122,9 +215,549 @@ describe('github', () => {
         expect(fetchMock).toHaveBeenCalledTimes(1);
       }
     });
+
+    it('cancels a pending 5xx retry backoff when its request signal is aborted', async () => {
+      vi.useFakeTimers();
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+        options?.signal?.throwIfAborted();
+        return new Response(JSON.stringify({ message: 'server error' }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' },
+        });
+      });
+      const controller = new AbortController();
+      const client = new OctokitGitHub('fake-token', 2);
+      const request = client.run('org', 'repo', 42, { signal: controller.signal });
+      const settled = vi.fn();
+      void request.then(settled, settled);
+
+      await advanceUntilCalled(fetchMock);
+      await flushUntilTimerScheduled();
+      await flushMicrotasks();
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+      expect(settled).not.toHaveBeenCalled();
+
+      controller.abort();
+      await flushShortDelayWorkUntilCalled(settled);
+
+      expect(settled).toHaveBeenCalledOnce();
+      await request.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fetchMock).toHaveBeenCalledOnce();
+    });
+
+    it('cancels a pending primary-rate-limit backoff when its request signal is aborted', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-07-15T12:00:00Z'));
+      const resetAtSeconds = Math.floor(Date.now() / 1000) + 600;
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+        options?.signal?.throwIfAborted();
+        return new Response(JSON.stringify({ message: 'API rate limit exceeded' }), {
+          status: 403,
+          headers: {
+            'content-type': 'application/json',
+            'x-ratelimit-remaining': '0',
+            'x-ratelimit-reset': String(resetAtSeconds),
+          },
+        });
+      });
+      const controller = new AbortController();
+      const client = new OctokitGitHub('fake-token');
+      const request = client.run('org', 'repo', 42, { signal: controller.signal });
+      const settled = vi.fn();
+      void request.then(settled, settled);
+
+      await advanceUntilCalled(fetchMock);
+      await flushUntilTimerScheduled();
+      await flushMicrotasks();
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+      expect(settled).not.toHaveBeenCalled();
+
+      controller.abort();
+      await flushShortDelayWorkUntilCalled(settled);
+
+      expect(settled).toHaveBeenCalledOnce();
+      await request.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(fetchMock).toHaveBeenCalledOnce();
+    });
+
+    it('cancels a paginated retry backoff when its request signal is aborted', async () => {
+      vi.useFakeTimers();
+      const controller = new AbortController();
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+        if (controller.signal.aborted) {
+          return new Response(JSON.stringify({ message: 'cleanup' }), {
+            status: 401,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({ message: 'server error' }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' },
+        });
+      });
+      const request = new OctokitGitHub('fake-token', 2).workflows('org', 'repo', {
+        signal: controller.signal,
+      });
+      const settled = vi.fn();
+      void request.then(settled, settled);
+
+      try {
+        await advanceUntilCalled(fetchMock);
+        await flushUntilTimerScheduled();
+        await flushMicrotasks();
+        expect(fetchMock).toHaveBeenCalledOnce();
+        expect(fetchMock.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
+        expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+        controller.abort();
+        await flushShortDelayWorkUntilCalled(settled);
+
+        expect(settled).toHaveBeenCalledOnce();
+        await request.catch(() => undefined);
+        expect(vi.getTimerCount()).toBe(0);
+
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(fetchMock).toHaveBeenCalledOnce();
+      } finally {
+        controller.abort();
+        await advanceUntilCalled(settled);
+        await request.catch(() => undefined);
+      }
+    });
+
+    it('logs only the one primary-rate-limit retry that is actually scheduled', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-07-15T12:00:00Z'));
+      const resetAtSeconds = Math.floor(Date.now() / 1000) - 1;
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(JSON.stringify({ message: 'API rate limit exceeded' }), {
+          status: 403,
+          headers: {
+            'content-type': 'application/json',
+            'x-ratelimit-remaining': '0',
+            'x-ratelimit-reset': String(resetAtSeconds),
+          },
+        }),
+      );
+      const request = new OctokitGitHub('fake-token').run('org', 'repo', 42);
+      const rejection = expect(request).rejects.toMatchObject({ status: 403 });
+      const settled = vi.fn();
+      void request.then(settled, settled);
+
+      await advanceUntilCalled(fetchMock);
+      await advanceUntilCallCount(fetchMock, 2);
+      await flushShortDelayWorkUntilCalled(settled);
+      await rejection;
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const messages = vi
+        .mocked(warning)
+        .mock.calls.map(([message]) => (typeof message === 'string' ? message : message.message));
+      expect(
+        messages.filter((message) => message.startsWith('Request quota exhausted for request')),
+      ).toHaveLength(2);
+      expect(messages.filter((message) => message.startsWith('Retrying after'))).toEqual([
+        'Retrying after 0 seconds!',
+      ]);
+    });
+
+    it('does not reinterpret a secondary limit as a primary limit', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-07-15T12:00:00Z'));
+      const resetAtSeconds = Math.floor(Date.now() / 1000) + 600;
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(JSON.stringify({ message: 'You have exceeded a secondary rate limit' }), {
+          status: 403,
+          headers: {
+            'content-type': 'application/json',
+            'retry-after': '60',
+            'x-ratelimit-remaining': '0',
+            'x-ratelimit-reset': String(resetAtSeconds),
+          },
+        }),
+      );
+      const controller = new AbortController();
+      const request = new OctokitGitHub('fake-token').run('org', 'repo', 42, {
+        signal: controller.signal,
+      });
+      const rejection = request.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      const settled = vi.fn();
+      void request.then(settled, settled);
+
+      try {
+        await advanceUntilCalled(fetchMock);
+        await flushShortDelayWorkUntilCalled(settled);
+
+        expect(settled).toHaveBeenCalledOnce();
+        await expect(rejection).resolves.toMatchObject({
+          message: 'You have exceeded a secondary rate limit',
+          status: 403,
+        });
+        expect(fetchMock).toHaveBeenCalledOnce();
+        const messages = vi
+          .mocked(warning)
+          .mock.calls.map(([message]) => (typeof message === 'string' ? message : message.message));
+        expect(
+          messages.filter((message) =>
+            message.startsWith('Secondary rate limit detected for request'),
+          ),
+        ).toHaveLength(1);
+        expect(messages.filter((message) => message.startsWith('Retrying after'))).toEqual([]);
+
+        await vi.advanceTimersByTimeAsync(600_000);
+        expect(fetchMock).toHaveBeenCalledOnce();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        controller.abort();
+        await request.catch(() => undefined);
+      }
+    });
+  });
+
+  describe('API wrappers', () => {
+    it.each([
+      [
+        'workflow',
+        (client: OctokitGitHub, options: GitHubRequestOptions) =>
+          client.workflows('org', 'repo', options),
+        1,
+      ],
+      [
+        'workflow-run',
+        (client: OctokitGitHub, options: GitHubRequestOptions) =>
+          client.runs('org', 'repo', 123, {}, options),
+        ACTIVE_RUN_STATUSES.length,
+      ],
+      [
+        'job',
+        (client: OctokitGitHub, options: GitHubRequestOptions) =>
+          client.jobs('org', 'repo', 42, options),
+        1,
+      ],
+    ] as const)(
+      'aborts pending %s pagination fetches',
+      async (_description, startRequest, expectedFetches) => {
+        vi.useFakeTimers();
+        const pendingRejects: Array<(reason?: unknown) => void> = [];
+        const observedSignals: Array<AbortSignal | null | undefined> = [];
+        const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(
+          async (_url, options) =>
+            new Promise<Response>((_resolve, reject) => {
+              const signal = options?.signal;
+              observedSignals.push(signal);
+              pendingRejects.push(reject);
+              signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+            }),
+        );
+        const controller = new AbortController();
+        const request = startRequest(new OctokitGitHub('fake-token'), {
+          signal: controller.signal,
+        });
+        const settled = vi.fn();
+        void request.then(settled, settled);
+
+        await advanceUntilCallCount(fetchMock, expectedFetches);
+        expect(fetchMock).toHaveBeenCalledTimes(expectedFetches);
+
+        controller.abort();
+        try {
+          await flushShortDelayWorkUntilCalled(settled);
+
+          expect(observedSignals).toHaveLength(expectedFetches);
+          expect(
+            observedSignals.every((signal) => signal === controller.signal && signal.aborted),
+          ).toBe(true);
+          expect(settled).toHaveBeenCalledOnce();
+          await request.catch(() => undefined);
+          expect(vi.getTimerCount()).toBe(0);
+        } finally {
+          for (const reject of pendingRejects) {
+            reject(new Error('test cleanup'));
+          }
+          await advanceUntilCalled(settled);
+          await request.catch(() => undefined);
+        }
+      },
+    );
+
+    it('keeps the abort signal bound on subsequent pagination pages', async () => {
+      vi.useFakeTimers();
+      let rejectSecondPage: ((reason?: unknown) => void) | undefined;
+      const fetchMock = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ total_count: 2, workflows: [{ id: 1, name: 'First' }] }), {
+            status: 200,
+            headers: {
+              'content-type': 'application/json',
+              link: '<https://api.github.com/repos/org/repo/actions/workflows?page=2>; rel="next"',
+            },
+          }),
+        )
+        .mockImplementationOnce(
+          async (_url, options) =>
+            new Promise<Response>((_resolve, reject) => {
+              rejectSecondPage = reject;
+              options?.signal?.addEventListener('abort', () => reject(options.signal?.reason), {
+                once: true,
+              });
+            }),
+        );
+      const controller = new AbortController();
+      const request = new OctokitGitHub('fake-token').workflows('org', 'repo', {
+        signal: controller.signal,
+      });
+      const settled = vi.fn();
+      void request.then(settled, settled);
+
+      await advanceUntilCallCount(fetchMock, 2);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(
+        fetchMock.mock.calls.every(([, options]) => options?.signal === controller.signal),
+      ).toBe(true);
+
+      controller.abort();
+      try {
+        await flushShortDelayWorkUntilCalled(settled);
+
+        expect(settled).toHaveBeenCalledOnce();
+        await request.catch(() => undefined);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        rejectSecondPage?.(new Error('test cleanup'));
+        await advanceUntilCalled(settled);
+        await request.catch(() => undefined);
+      }
+    });
+
+    it('does not start another pagination page after the monotonic deadline', async () => {
+      const fake = manualTiming();
+      const deadline = new ActionDeadline({ mode: 'abort', seconds: 1 }, fake.timing);
+      const fetchMock = vi
+        .spyOn(globalThis, 'fetch')
+        .mockImplementationOnce(async () => {
+          fake.advanceTo(1_000);
+          return new Response(
+            JSON.stringify({ total_count: 2, workflows: [{ id: 1, name: 'First' }] }),
+            {
+              status: 200,
+              headers: {
+                'content-type': 'application/json',
+                link: '<https://api.github.com/repos/org/repo/actions/workflows?page=2>; rel="next"',
+              },
+            },
+          );
+        })
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ total_count: 2, workflows: [{ id: 2, name: 'Second' }] }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      const requestOptions = {
+        signal: deadline.signal,
+        checkDeadline: deadline.throwIfReached,
+      } as GitHubRequestOptions;
+      const request = new OctokitGitHub('fake-token').workflows('org', 'repo', requestOptions);
+
+      try {
+        await expect(request).rejects.toEqual(new DeadlineReached('abort', 1));
+        expect(fetchMock).toHaveBeenCalledOnce();
+        expect(deadline.signal.aborted).toBe(true);
+      } finally {
+        deadline.dispose();
+        await request.catch(() => undefined);
+      }
+
+      expect(fake.timerCount()).toBe(0);
+    });
+
+    it.each([
+      ['the default GitHub API', undefined, 'https://api.github.com'],
+      [
+        'a configured GitHub Enterprise API',
+        'https://github.example/api/v3',
+        'https://github.example/api/v3',
+      ],
+    ] as const)('uses %s base URL', async (_description, configuredUrl, expectedUrl) => {
+      vi.stubEnv('GITHUB_API_URL', configuredUrl);
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(JSON.stringify({ id: 42 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+
+      await new OctokitGitHub('fake-token').run('org', 'repo', 42);
+
+      const request = fetchMock.mock.calls[0]?.[0];
+      expect(request).toBeDefined();
+      expect(request instanceof Request ? request.url : String(request)).toBe(
+        `${expectedUrl}/repos/org/repo/actions/runs/42`,
+      );
+    });
+
+    it('paginates workflows with repository coordinates and forwards an abort signal', async () => {
+      const listRepoWorkflows = mockRequestMethod();
+      const paginate = vi
+        .fn()
+        .mockResolvedValueOnce([{ id: 123, name: 'CI' }])
+        .mockResolvedValueOnce([{ id: 456, name: 'Deploy' }]);
+      const client = new OctokitGitHub('fake-token');
+      replaceOctokit(client, {
+        actions: { listRepoWorkflows: listRepoWorkflows.request },
+        paginate,
+      });
+
+      await expect(client.workflows('org', 'repo')).resolves.toEqual([{ id: 123, name: 'CI' }]);
+      const signal = new AbortController().signal;
+      await expect(client.workflows('org', 'repo', { signal })).resolves.toEqual([
+        { id: 456, name: 'Deploy' },
+      ]);
+      expect(paginate).toHaveBeenNthCalledWith(1, listRepoWorkflows.request, {
+        owner: 'org',
+        repo: 'repo',
+        per_page: 100,
+      });
+      expect(listRepoWorkflows.defaults).toHaveBeenCalledWith({ request: { signal } });
+      expect(paginate).toHaveBeenNthCalledWith(2, listRepoWorkflows.bound, {
+        owner: 'org',
+        repo: 'repo',
+        per_page: 100,
+      });
+    });
+
+    it('fetches a workflow run with and without an abort signal', async () => {
+      const workflowRun = run({ id: 42, status: 'in_progress', conclusion: null });
+      const getWorkflowRun = vi.fn().mockResolvedValue({ data: workflowRun });
+      const client = new OctokitGitHub('fake-token');
+      replaceOctokit(client, {
+        actions: { getWorkflowRun },
+        paginate: vi.fn(),
+      });
+
+      await expect(client.run('org', 'repo', 42)).resolves.toBe(workflowRun);
+      const signal = new AbortController().signal;
+      await expect(client.run('org', 'repo', 42, { signal })).resolves.toBe(workflowRun);
+
+      expect(getWorkflowRun).toHaveBeenNthCalledWith(1, {
+        owner: 'org',
+        repo: 'repo',
+        run_id: 42,
+      });
+      expect(getWorkflowRun).toHaveBeenNthCalledWith(2, {
+        owner: 'org',
+        repo: 'repo',
+        run_id: 42,
+        request: { signal },
+      });
+    });
+
+    it('paginates jobs and returns present or missing job steps', async () => {
+      const listJobsForWorkflowRun = vi.fn();
+      const getJobForWorkflowRun = vi
+        .fn()
+        .mockResolvedValueOnce({ data: { steps: [{ number: 1, name: 'Build' }] } })
+        .mockResolvedValueOnce({ data: {} });
+      const paginate = vi.fn().mockResolvedValue([{ id: 7, name: 'build' }]);
+      const client = new OctokitGitHub('fake-token');
+      replaceOctokit(client, {
+        actions: { listJobsForWorkflowRun, getJobForWorkflowRun },
+        paginate,
+      });
+
+      await expect(client.jobs('org', 'repo', 42)).resolves.toEqual([{ id: 7, name: 'build' }]);
+      expect(paginate).toHaveBeenCalledWith(listJobsForWorkflowRun, {
+        owner: 'org',
+        repo: 'repo',
+        run_id: 42,
+        per_page: 100,
+      });
+      await expect(client.steps('org', 'repo', 7)).resolves.toEqual([{ number: 1, name: 'Build' }]);
+      await expect(client.steps('org', 'repo', 8)).resolves.toEqual([]);
+      expect(getJobForWorkflowRun).toHaveBeenNthCalledWith(2, {
+        owner: 'org',
+        repo: 'repo',
+        job_id: 8,
+      });
+    });
+
+    it('forwards abort signals for job and step reads', async () => {
+      const listJobsForWorkflowRun = mockRequestMethod();
+      const getJobForWorkflowRun = vi.fn().mockResolvedValue({ data: { steps: [] } });
+      const paginate = vi.fn().mockResolvedValue([]);
+      const client = new OctokitGitHub('fake-token');
+      replaceOctokit(client, {
+        actions: { listJobsForWorkflowRun: listJobsForWorkflowRun.request, getJobForWorkflowRun },
+        paginate,
+      });
+      const signal = new AbortController().signal;
+
+      await client.jobs('org', 'repo', 42, { signal });
+      await client.steps('org', 'repo', 7, { signal });
+
+      expect(listJobsForWorkflowRun.defaults).toHaveBeenCalledWith({ request: { signal } });
+      expect(paginate).toHaveBeenCalledWith(listJobsForWorkflowRun.bound, {
+        owner: 'org',
+        repo: 'repo',
+        run_id: 42,
+        per_page: 100,
+      });
+      expect(getJobForWorkflowRun).toHaveBeenCalledWith({
+        owner: 'org',
+        repo: 'repo',
+        job_id: 7,
+        request: { signal },
+      });
+    });
   });
 
   describe('runs', () => {
+    it('de-duplicates the same active run returned by multiple status queries', async () => {
+      const duplicateRun = run({ id: 7, status: 'queued', conclusion: null });
+      const { client } = clientWithRunPages([[duplicateRun]], [[duplicateRun]], []);
+
+      await expect(client.runs('org', 'repo', 123)).resolves.toEqual([duplicateRun]);
+    });
+
+    it('matches queue names against the workflow name and excludes inactive runs', async () => {
+      const matchingRun = run({
+        id: 1,
+        status: 'queued',
+        conclusion: null,
+        display_title: 'other-title',
+        name: 'deploy-api',
+      });
+      const completedRun = run({
+        id: 2,
+        status: 'completed',
+        conclusion: 'success',
+        display_title: 'deploy-api',
+      });
+      const missingStatusRun = run({
+        id: 3,
+        status: null,
+        conclusion: null,
+        display_title: 'deploy-api',
+      });
+      const { client } = clientWithRunPages(
+        [],
+        [[matchingRun, completedRun, missingStatusRun]],
+        [],
+      );
+
+      await expect(client.runs('org', 'repo', 123, { queueName: 'deploy-api' })).resolves.toEqual([
+        matchingRun,
+      ]);
+    });
+
     it('does not perform an unfiltered historical walk when only active runs can be eligible', async () => {
       const completedHistoricalPages = Array.from({ length: 51 }, (_, pageIndex) =>
         Array.from({ length: 100 }, (_, runIndex) =>
@@ -303,6 +936,38 @@ describe('github', () => {
       expect(paginate.mock.calls.every(([, options]) => !('workflow_id' in options))).toBe(true);
       expect(paginate.mock.calls.map(([, options]) => options.status)).toEqual(ACTIVE_RUN_STATUSES);
     });
+
+    it('forwards abort signals through workflow and repository run pagination', async () => {
+      const signal = new AbortController().signal;
+      const { client, listWorkflowRuns, listWorkflowRunsForRepo, paginate } = clientWithRunPages(
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+      );
+
+      await client.runs('org', 'repo', 123, {}, { signal });
+      await client.activeRunsForRepo('org', 'repo', {}, { signal });
+
+      expect(paginate).toHaveBeenCalledTimes(ACTIVE_RUN_STATUSES.length * 2);
+      expect(listWorkflowRuns.defaults).toHaveBeenCalledTimes(ACTIVE_RUN_STATUSES.length);
+      expect(listWorkflowRunsForRepo.defaults).toHaveBeenCalledTimes(ACTIVE_RUN_STATUSES.length);
+      expect(listWorkflowRuns.defaults).toHaveBeenCalledWith({ request: { signal } });
+      expect(listWorkflowRunsForRepo.defaults).toHaveBeenCalledWith({ request: { signal } });
+      expect(paginate.mock.calls.every(([, options]) => !('request' in options))).toBe(true);
+      expect(
+        paginate.mock.calls
+          .slice(0, ACTIVE_RUN_STATUSES.length)
+          .every(([request]) => request === listWorkflowRuns.bound),
+      ).toBe(true);
+      expect(
+        paginate.mock.calls
+          .slice(ACTIVE_RUN_STATUSES.length)
+          .every(([request]) => request === listWorkflowRunsForRepo.bound),
+      ).toBe(true);
+    });
   });
 
   describe('rate-limit logging', () => {
@@ -319,6 +984,26 @@ describe('github', () => {
       expect(warning).toHaveBeenCalledWith(
         'Secondary rate limit detected for request GET /secondary-limited',
       );
+    });
+
+    it('does not retry after the first primary rate-limit retry', () => {
+      const throttleOptions = createThrottleOptions();
+
+      expect(
+        throttleOptions.onRateLimit(30, { method: 'GET', url: '/rate-limited' }, {}, 1),
+      ).toBeUndefined();
+      expect(warning).toHaveBeenCalledWith('Request quota exhausted for request GET /rate-limited');
+      expect(warning).not.toHaveBeenCalledWith('Retrying after 30 seconds!');
+    });
+
+    it('can defer primary retry scheduling to the abortable request hook', () => {
+      const throttleOptions = createThrottleOptions(false);
+
+      expect(
+        throttleOptions.onRateLimit(30, { method: 'GET', url: '/rate-limited' }, {}, 0),
+      ).toBeUndefined();
+      expect(warning).toHaveBeenCalledWith('Request quota exhausted for request GET /rate-limited');
+      expect(warning).not.toHaveBeenCalledWith('Retrying after 30 seconds!');
     });
   });
 });
